@@ -221,3 +221,4 @@ __marimo__/
 venv/
 __pycache__/
 *.pyc
+self_help_bot.db
