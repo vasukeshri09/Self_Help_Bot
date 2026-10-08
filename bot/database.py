@@ -1,11 +1,33 @@
+import os
 import sqlite3
 
-DATABASE = "self_help_bot.db"
 
+# ==================================================
+# Database Configuration
+# ==================================================
+
+DATABASE_DIR = "data"
+
+# Create database directory if it doesn't exist
+os.makedirs(DATABASE_DIR, exist_ok=True)
+
+DATABASE = os.path.join(
+    DATABASE_DIR,
+    "self_help_bot.db"
+)
+
+
+# ==================================================
+# Database Connection
+# ==================================================
 
 def get_connection():
     return sqlite3.connect(DATABASE)
 
+
+# ==================================================
+# Task Database
+# ==================================================
 
 def initialize_database():
     connection = get_connection()
@@ -29,12 +51,17 @@ def add_task(user_id, task):
     cursor = connection.cursor()
 
     cursor.execute(
-        "INSERT INTO tasks (user_id, task) VALUES (?, ?)",
+        """
+        INSERT INTO tasks (user_id, task)
+        VALUES (?, ?)
+        """,
         (user_id, task)
     )
 
     connection.commit()
+
     task_id = cursor.lastrowid
+
     connection.close()
 
     return task_id
@@ -55,6 +82,7 @@ def get_tasks(user_id):
     )
 
     tasks = cursor.fetchall()
+
     connection.close()
 
     return tasks
@@ -100,6 +128,11 @@ def delete_task(user_id, task_id):
 
     return deleted
 
+
+# ==================================================
+# Reminder Database
+# ==================================================
+
 def initialize_reminders_table():
     connection = get_connection()
     cursor = connection.cursor()
@@ -118,20 +151,36 @@ def initialize_reminders_table():
     connection.close()
 
 
-def add_reminder(user_id, chat_id, reminder_text, remind_at):
+def add_reminder(
+    user_id,
+    chat_id,
+    reminder_text,
+    remind_at
+):
     connection = get_connection()
     cursor = connection.cursor()
 
     cursor.execute(
         """
         INSERT INTO reminders
-        (user_id, chat_id, reminder_text, remind_at)
+        (
+            user_id,
+            chat_id,
+            reminder_text,
+            remind_at
+        )
         VALUES (?, ?, ?, ?)
         """,
-        (user_id, chat_id, reminder_text, remind_at)
+        (
+            user_id,
+            chat_id,
+            reminder_text,
+            remind_at
+        )
     )
 
     connection.commit()
+
     reminder_id = cursor.lastrowid
 
     connection.close()
@@ -145,13 +194,19 @@ def get_pending_reminders():
 
     cursor.execute(
         """
-        SELECT id, user_id, chat_id, reminder_text, remind_at
+        SELECT
+            id,
+            user_id,
+            chat_id,
+            reminder_text,
+            remind_at
         FROM reminders
         ORDER BY remind_at
         """
     )
 
     reminders = cursor.fetchall()
+
     connection.close()
 
     return reminders
@@ -163,7 +218,10 @@ def get_user_reminders(user_id):
 
     cursor.execute(
         """
-        SELECT id, reminder_text, remind_at
+        SELECT
+            id,
+            reminder_text,
+            remind_at
         FROM reminders
         WHERE user_id = ?
         ORDER BY remind_at
@@ -172,21 +230,29 @@ def get_user_reminders(user_id):
     )
 
     reminders = cursor.fetchall()
+
     connection.close()
 
     return reminders
 
 
-def delete_reminder(reminder_id, user_id):
+def delete_reminder(
+    reminder_id,
+    user_id
+):
     connection = get_connection()
     cursor = connection.cursor()
 
     cursor.execute(
         """
         DELETE FROM reminders
-        WHERE id = ? AND user_id = ?
+        WHERE id = ?
+        AND user_id = ?
         """,
-        (reminder_id, user_id)
+        (
+            reminder_id,
+            user_id
+        )
     )
 
     deleted = cursor.rowcount
