@@ -26,6 +26,7 @@ from bot.reminders import (
     remind_command,
     reminders_command,
     cancel_reminder_command,
+    schedule_pending_reminders,
 )
 
 
@@ -56,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 async def start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
     await update.message.reply_text(
         "Hello! 👋\n\n"
@@ -69,7 +70,7 @@ async def start(
 
 async def help_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
     await update.message.reply_text(
         "🤖 Self Help Bot\n\n"
@@ -102,7 +103,7 @@ async def help_command(
 
 async def error_handler(
     update: object,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
     logger.error(
         "Exception while processing an update:",
@@ -126,7 +127,7 @@ def main():
         )
 
     # ------------------------------------------------
-    # Initialize databases
+    # Initialize Databases
     # ------------------------------------------------
 
     initialize_database()
@@ -136,7 +137,11 @@ def main():
     # Create Telegram Application
     # ------------------------------------------------
 
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .build()
+    )
 
     # ------------------------------------------------
     # General Commands
@@ -185,7 +190,7 @@ def main():
     app.add_handler(
         CommandHandler(
             "cancelreminder",
-            cancel_reminder_command
+            cancel_reminder_command,
         )
     )
 
@@ -196,10 +201,22 @@ def main():
     app.add_error_handler(error_handler)
 
     # ------------------------------------------------
+    # Restore Pending Reminders
+    # ------------------------------------------------
+
+    schedule_pending_reminders(app)
+
+    logger.info(
+        "Pending reminders restored."
+    )
+
+    # ------------------------------------------------
     # Start Bot
     # ------------------------------------------------
 
-    print("Self Help Bot is running...")
+    logger.info(
+        "Self Help Bot is starting..."
+    )
 
     app.run_polling()
 
