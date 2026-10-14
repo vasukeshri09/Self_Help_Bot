@@ -1,187 +1,51 @@
-import re
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from telegram import Update
-from telegram.ext import ContextTypes
+from telegram.ext import (
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 from bot.database import (
     add_reminder,
     get_pending_reminders,
     get_user_reminders,
     delete_reminder,
+    delete_reminder_record,
 )
-
-
-# ==================================================
-# Logging
-# ==================================================
 
 logger = logging.getLogger(__name__)
+LOCAL_TZ = ZoneInfo("Asia/Kolkata")
+
+ASK_MESSAGE, ASK_DATE, ASK_TIME = range(3)
 
 
-# ==================================================
-# Duration Parser
-# ==================================================
+def schedule_reminder(application, reminder):
+    """Schedule one saved reminder using its database record."""
+    reminder_id, user_id, chat_id, reminder_text, remind_at = reminder[:5]
 
-DURATION_PATTERN = re.compile(
-    r"^(\d+)(s|m|h|d)$",
-    re.IGNORECASE,
-)
+    remind_datetime = datetime.fromisoformat(remind_at)
+    if remind_datetime.tzinfo is None:
+        remind_datetime = remind_datetime.replace(tzinfo=LOCAL_TZ)
 
-
-def parse_duration(duration):
-    """
-    Convert a duration string such as:
-    10s, 10m, 2h, 1d
-    into a timedelta object.
-    """
-
-    match = DURATION_PATTERN.match(duration)
-
-    if not match:
-        return None
-
-    value = int(match.group(1))
-    unit = match.group(2).lower()
-
-    if unit == "s":
-        return timedelta(seconds=value)
-
-    if unit == "m":
-        return timedelta(minutes=value)
-
-    if unit == "h":
-        return timedelta(hours=value)
-
-    if unit == "d":
-        return timedelta(days=value)
-
-    return None
-
-
-# ==================================================
-# Send Reminder
-# ==================================================
-
-async def send_reminder(
-    context: ContextTypes.DEFAULT_TYPE
-):
-    """
-    Send a reminder message and remove it from
-    the database after successful delivery.
-    """
-
-    job_data = context.job.data
-
-    reminder_id = job_data["reminder_id"]
-    user_id = job_data["user_id"]
-    chat_id = job_data["chat_id"]
-    reminder_text = job_data["reminder_text"]
-
-    try:
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "⏰ Reminder!\n\n"
-                f"{reminder_text}"
-            ),
-        )
-
-        # Delete reminder after successful delivery
-        delete_reminder(
-            reminder_id,
-            user_id,
-        )
-
-        logger.info(
-            f"Reminder {reminder_id} sent successfully."
-        )
-
-    except Exception:
-        logger.exception(
-            f"Failed to send reminder {reminder_id}."
-        )
-
-
-# ==================================================
-# /remind Command
-# ==================================================
-
-async def remind_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if len(context.args) < 2:
-
-        await update.message.reply_text(
-            "Usage:\n"
-            "/remind <duration> <message>\n\n"
-
-            "Examples:\n"
-            "/remind 10m Complete DSA assignment\n"
-            "/remind 2h Submit project\n"
-            "/remind 1d Call home"
-        )
-
-        return
-
-    duration_text = context.args[0]
-
-    reminder_text = " ".join(
-        context.args[1:]
+    delay = max(
+        1,
+        (remind_datetime - datetime.now(LOCAL_TZ)).total_seconds(),
     )
 
-    duration = parse_duration(
-        duration_text
-    )
-
-    if duration is None:
-
-        await update.message.reply_text(
-            "❌ Invalid duration.\n\n"
-
-            "Use formats like:\n"
-            "10s = 10 seconds\n"
-            "10m = 10 minutes\n"
-            "2h = 2 hours\n"
-            "1d = 1 day"
+    if application.job_queue is None:
+        raise RuntimeError(
+            "JobQueue is unavailable. Install python-telegram-bot with the job-queue extra."
         )
 
-        return
-
-    if duration.total_seconds() <= 0:
-
-        await update.message.reply_text(
-            "❌ Duration must be greater than zero."
-        )
-
-        return
-
-    # User and chat information
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-
-    # Calculate reminder time in UTC
-    remind_at = (
-        datetime.now(timezone.utc)
-        + duration
-    )
-
-    # Save reminder in SQLite
-    reminder_id = add_reminder(
-        user_id,
-        chat_id,
-        reminder_text,
-        remind_at.isoformat(),
-    )
-
-    # Schedule Telegram JobQueue task
-    context.job_queue.run_once(
+    application.job_queue.run_once(
         send_reminder,
-        when=duration.total_seconds(),
+        when=delay,
         data={
             "reminder_id": reminder_id,
             "user_id": user_id,
@@ -191,241 +55,270 @@ async def remind_command(
         name=f"reminder_{reminder_id}",
     )
 
+
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Send a due reminder and remove its database record after successful delivery."""
+    data = context.job.data
+
+    try:
+        await context.bot.send_message(
+            chat_id=data["chat_id"],
+            text=f"⏰ Reminder!\n\n{data['reminder_text']}",
+        )
+    except Exception:
+        logger.exception("Failed to send reminder %s.", data["reminder_id"])
+        return
+
+    delete_reminder_record(data["reminder_id"], data["user_id"])
+    logger.info("Reminder %s sent and removed.", data["reminder_id"])
+
+
+async def remind_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    context.user_data.pop("new_reminder", None)
     await update.message.reply_text(
-        "⏰ Reminder set!\n\n"
+        "What would you like to be reminded about?"
+    )
+    return ASK_MESSAGE
 
+
+async def receive_reminder_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.message.text.strip()
+
+    if not message:
+        await update.message.reply_text("Please enter a reminder message.")
+        return ASK_MESSAGE
+
+    context.user_data["new_reminder"] = {"message": message}
+
+    await update.message.reply_text(
+        "Enter the date in DD/MM/YY format, or type 'today' for a same-day reminder.\n"
+        "Example: 20/10/26"
+    )
+    return ASK_DATE
+
+
+async def receive_reminder_date(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    date_text = update.message.text.strip().lower()
+
+    try:
+        if date_text == "today":
+            selected_date = datetime.now(LOCAL_TZ).date()
+        else:
+            selected_date = datetime.strptime(date_text, "%d/%m/%y").date()
+
+        if selected_date < datetime.now(LOCAL_TZ).date():
+            raise ValueError
+
+    except ValueError:
+        await update.message.reply_text(
+            "Invalid date or date is in the past.\n"
+            "Use DD/MM/YY, for example 20/10/26, or type 'today'."
+        )
+        return ASK_DATE
+
+    context.user_data["new_reminder"]["date"] = selected_date.isoformat()
+
+    await update.message.reply_text(
+        "Enter the time in 24-hour HH:MM format.\n"
+        "Example: 18:30 for 6:30 PM"
+    )
+    return ASK_TIME
+
+
+async def receive_reminder_time(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    try:
+        selected_time = datetime.strptime(
+            update.message.text.strip(), "%H:%M"
+        ).time()
+
+        details = context.user_data["new_reminder"]
+        remind_at = datetime.fromisoformat(
+            details["date"]
+        ).replace(
+            hour=selected_time.hour,
+            minute=selected_time.minute,
+            second=0,
+            microsecond=0,
+            tzinfo=LOCAL_TZ,
+        )
+
+        if remind_at <= datetime.now(LOCAL_TZ):
+            await update.message.reply_text(
+                "That date and time has already passed. Enter a future time."
+            )
+            return ASK_TIME
+
+    except ValueError:
+        await update.message.reply_text(
+            "Invalid time. Please use HH:MM, for example 18:30."
+        )
+        return ASK_TIME
+
+    user = update.effective_user
+    chat = update.effective_chat
+    message = details["message"]
+    remind_at_text = remind_at.isoformat()
+
+    reminder_id = add_reminder(
+        user.id,
+        chat.id,
+        message,
+        remind_at_text,
+    )
+
+    try:
+        schedule_reminder(
+            context.application,
+            (
+                reminder_id,
+                user.id,
+                chat.id,
+                message,
+                remind_at_text,
+            ),
+        )
+    except Exception:
+        # Keep the database record so it can be restored on the next startup.
+        logger.exception("Reminder %s was saved but could not be scheduled.", reminder_id)
+        await update.message.reply_text(
+            "⚠️ The reminder was saved, but could not be scheduled right now. "
+            "It may be restored when the bot restarts."
+        )
+        context.user_data.pop("new_reminder", None)
+        return ConversationHandler.END
+
+    context.user_data.pop("new_reminder", None)
+
+    await update.message.reply_text(
+        "✅ Reminder scheduled!\n\n"
         f"ID: {reminder_id}\n"
-        f"Message: {reminder_text}\n"
-        f"After: {duration_text}"
+        f"Message: {message}\n"
+        f"Date: {remind_at.strftime('%d/%m/%y')}\n"
+        f"Time: {remind_at.strftime('%H:%M')}"
+    )
+    return ConversationHandler.END
+
+
+async def cancel_reminder_setup(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    context.user_data.pop("new_reminder", None)
+    await update.message.reply_text("Reminder setup cancelled.")
+    return ConversationHandler.END
+
+
+def get_remind_conversation_handler():
+    return ConversationHandler(
+        entry_points=[CommandHandler("remind", remind_start)],
+        states={
+            ASK_MESSAGE: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    receive_reminder_message,
+                )
+            ],
+            ASK_DATE: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    receive_reminder_date,
+                )
+            ],
+            ASK_TIME: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    receive_reminder_time,
+                )
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_reminder_setup)],
+        allow_reentry=True,
     )
 
-    logger.info(
-        f"Reminder {reminder_id} created "
-        f"for user {user_id}."
-    )
-
-
-# ==================================================
-# /reminders Command
-# ==================================================
 
 async def reminders_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
-    user_id = update.effective_user.id
-
-    reminders = get_user_reminders(
-        user_id
-    )
+    reminders = get_user_reminders(update.effective_user.id)
 
     if not reminders:
-
         await update.message.reply_text(
-            "⏰ You don't have any pending reminders."
+            "⏰ You have no standalone reminders pending."
         )
-
         return
 
     message = "⏰ Your Reminders\n\n"
 
-    for reminder_id, text, remind_at in reminders:
+    for reminder_id, reminder_text, remind_at in reminders:
+        try:
+            reminder_datetime = datetime.fromisoformat(remind_at)
+            if reminder_datetime.tzinfo is None:
+                reminder_datetime = reminder_datetime.replace(tzinfo=LOCAL_TZ)
+            else:
+                reminder_datetime = reminder_datetime.astimezone(LOCAL_TZ)
+            when = reminder_datetime.strftime("%d/%m/%y %H:%M")
+        except ValueError:
+            when = remind_at
 
-        message += (
-            f"{reminder_id}. {text}\n"
-            f"   🕐 {remind_at}\n\n"
-        )
+        message += f"{reminder_id}. {reminder_text}\n   {when}\n\n"
 
-    await update.message.reply_text(
-        message
-    )
+    await update.message.reply_text(message)
 
-
-# ==================================================
-# /cancelreminder Command
-# ==================================================
 
 async def cancel_reminder_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     if not context.args:
-
         await update.message.reply_text(
-            "Usage:\n"
-            "/cancelreminder <id>\n\n"
-
-            "Example:\n"
-            "/cancelreminder 1"
+            "Usage: /cancelreminder <id>"
         )
-
         return
 
     try:
-
-        reminder_id = int(
-            context.args[0]
-        )
-
+        reminder_id = int(context.args[0])
     except ValueError:
-
-        await update.message.reply_text(
-            "❌ Reminder ID must be a number."
-        )
-
+        await update.message.reply_text("Reminder ID must be a number.")
         return
 
     user_id = update.effective_user.id
-
-    # Delete from database
-    deleted = delete_reminder(
-        reminder_id,
-        user_id,
-    )
+    deleted = delete_reminder(reminder_id, user_id)
 
     if not deleted:
-
         await update.message.reply_text(
-            "❌ Reminder not found."
+            "Reminder not found, or it is a task deadline reminder."
         )
-
         return
 
-    # Remove scheduled JobQueue job
-    current_jobs = (
-        context.job_queue.get_jobs_by_name(
+    if context.job_queue is not None:
+        for job in context.job_queue.get_jobs_by_name(
             f"reminder_{reminder_id}"
-        )
-    )
-
-    for job in current_jobs:
-
-        job.schedule_removal()
+        ):
+            job.schedule_removal()
 
     await update.message.reply_text(
         f"🗑️ Reminder {reminder_id} cancelled."
     )
 
-    logger.info(
-        f"Reminder {reminder_id} cancelled "
-        f"by user {user_id}."
-    )
 
-
-# ==================================================
-# Restore Pending Reminders
-# ==================================================
-
-def schedule_pending_reminders(
-    application
-):
-    """
-    Restore reminders from SQLite when the bot starts.
-
-    This is important for deployment because the Telegram
-    JobQueue exists only in memory. If the bot/server restarts,
-    scheduled jobs disappear.
-
-    The reminders themselves remain in SQLite, so this function
-    recreates the missing JobQueue jobs.
-    """
-
-    pending_reminders = (
-        get_pending_reminders()
-    )
-
-    if not pending_reminders:
-
-        logger.info(
-            "No pending reminders to restore."
-        )
-
-        return
-
-    restored_count = 0
-
-    for reminder in pending_reminders:
-
+def schedule_pending_reminders(application):
+    """Restore saved reminders after bot startup."""
+    for reminder in get_pending_reminders():
         try:
-
-            # get_pending_reminders() returns:
-            #
-            # id,
-            # user_id,
-            # chat_id,
-            # reminder_text,
-            # remind_at
-
-            reminder_id = reminder[0]
-            user_id = reminder[1]
-            chat_id = reminder[2]
-            reminder_text = reminder[3]
-            remind_at = reminder[4]
-
-            # Convert ISO timestamp back to datetime
-            remind_datetime = (
-                datetime.fromisoformat(
-                    remind_at
-                )
-            )
-
-            # Ensure UTC timezone
-            if remind_datetime.tzinfo is None:
-
-                remind_datetime = (
-                    remind_datetime.replace(
-                        tzinfo=timezone.utc
-                    )
-                )
-
-            # Calculate remaining time
-            delay = (
-                remind_datetime
-                - datetime.now(timezone.utc)
-            ).total_seconds()
-
-            # If the bot was offline when the reminder
-            # should have fired, send it shortly after startup.
-            if delay <= 0:
-
-                delay = 1
-
-                logger.info(
-                    f"Reminder {reminder_id} "
-                    "was missed while bot was offline. "
-                    "Scheduling immediately."
-                )
-
-            # Recreate JobQueue job
-            application.job_queue.run_once(
-                send_reminder,
-                when=delay,
-                data={
-                    "reminder_id": reminder_id,
-                    "user_id": user_id,
-                    "chat_id": chat_id,
-                    "reminder_text": reminder_text,
-                },
-                name=f"reminder_{reminder_id}",
-            )
-
-            restored_count += 1
-
-            logger.info(
-                f"Restored reminder {reminder_id} "
-                f"(delay: {delay:.2f} seconds)"
-            )
-
+            schedule_reminder(application, reminder)
+            logger.info("Restored reminder %s.", reminder[0])
         except Exception:
-
-            logger.exception(
-                f"Failed to restore reminder: "
-                f"{reminder}"
-            )
-
-    logger.info(
-        f"Restored {restored_count} "
-        f"pending reminder(s)."
-    )
+            logger.exception("Could not restore reminder %s.", reminder[0])
